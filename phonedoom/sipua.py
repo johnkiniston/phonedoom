@@ -98,6 +98,7 @@ class Entry:
     tag: str
     owner: object
     ok: str = ""
+    cseq: str = ""
     acked: asyncio.Event = field(default_factory=asyncio.Event)
     retransmit: asyncio.Task | None = None
 
@@ -148,8 +149,8 @@ class UserAgent:
     async def _invite(self, msg, send, owner, link):
         cid = msg.get("call-id")
         old = self.calls.get(cid)
-        if old:  # UDP retransmit or re-INVITE
-            await send(old.ok)
+        if old:
+            await self._reinvite(old, msg, send, link)
             return
         if cid in self.pending:
             return
@@ -176,10 +177,25 @@ class UserAgent:
             await send(_response(msg, 487, "Request Terminated", tag, link=link))
             return
         ok = _response(msg, 200, "OK", tag, body=sdp, link=link)
-        entry = self.calls[cid] = Entry(call, tag, owner, ok)
+        entry = self.calls[cid] = Entry(call, tag, owner, ok, msg.get("cseq"))
         await send(ok)
         if link.transport == "udp":
             entry.retransmit = asyncio.create_task(self._retransmit(entry, send))
+
+    async def _reinvite(self, entry, msg, send, link):
+        cseq = msg.get("cseq")
+        if cseq == entry.cseq or not msg.body.strip():  # retransmit, or an offerless refresh
+            await send(entry.ok)
+            return
+        await send(_response(msg, 100, "Trying", entry.tag, link=link))
+        try:
+            sdp = await entry.call.reinvite(msg.body, link.local_ip)
+        except (UnsupportedMedia, ValueError) as e:
+            await send(_response(msg, 488, "Not Acceptable Here", entry.tag, link=link, extra=[("Warning", f'399 doom "{e}"')]))
+            return
+        entry.cseq = cseq
+        entry.ok = _response(msg, 200, "OK", entry.tag, body=sdp, link=link)
+        await send(entry.ok)
 
     async def _retransmit(self, entry, send):
         """RFC 3261 section 13.3.1.4. Resend the 200 over UDP until the ACK arrives."""

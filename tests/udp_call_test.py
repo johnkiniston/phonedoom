@@ -50,13 +50,13 @@ def answer_ports(sdp):
     return out
 
 
-def offer_sdp(ip, aport, vport, opus):
+def offer_sdp(ip, aport, vport, opus, video=True):
     audio = "m=audio %d RTP/AVP %s 0 101\r\n" % (aport, "111" if opus else "")
     audio = audio.replace("AVP  ", "AVP ")
     rtpmap = "a=rtpmap:111 opus/48000/2\r\n" if opus else ""
     return ("v=0\r\no=test 1 1 IN IP4 %s\r\ns=t\r\nc=IN IP4 %s\r\nt=0 0\r\n" % (ip, ip) + audio + rtpmap +
             "a=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n"
-            "m=video %d RTP/AVP 96\r\na=rtpmap:96 VP8/90000\r\na=sendrecv\r\n" % vport)
+            + ("m=video %d RTP/AVP 96\r\na=rtpmap:96 VP8/90000\r\na=sendrecv\r\n" % vport if video else ""))
 
 
 def rms_of(frames):
@@ -65,13 +65,13 @@ def rms_of(frames):
 
 async def main(a):
     loop = asyncio.get_running_loop()
-    ip = "127.0.0.1"
+    ip = a.local
     _, ap = await loop.create_datagram_endpoint(Media, local_addr=(ip, 0))
     _, vp = await loop.create_datagram_endpoint(Media, local_addr=(ip, 0))
     aport = ap.transport.get_extra_info("sockname")[1]
     vport = vp.transport.get_extra_info("sockname")[1]
     if a.tcp:
-        reader, writer = await asyncio.open_connection(ip, a.port)
+        reader, writer = await asyncio.open_connection(a.host, a.port)
         lport = writer.get_extra_info("sockname")[1]
     else:
         sip = Media()
@@ -81,7 +81,7 @@ async def main(a):
     call_id, tag = secrets.token_hex(6), secrets.token_hex(3)
 
     def request(method, cseq, extra="", body="", to_tag=""):
-        text = (f"{method} sip:doom@{ip}:{a.port} SIP/2.0\r\nVia: SIP/2.0/{proto} {ip}:{lport};branch=z9hG4bK{secrets.token_hex(4)};rport\r\n"
+        text = (f"{method} sip:666@{a.host}:{a.port} SIP/2.0\r\nVia: SIP/2.0/{proto} {ip}:{lport};branch=z9hG4bK{secrets.token_hex(4)};rport\r\n"
                 f"Max-Forwards: 70\r\nFrom: <sip:test@{ip}>;tag={tag}\r\nTo: <sip:doom@{ip}>{to_tag}\r\nCall-ID: {call_id}\r\n"
                 f"CSeq: {cseq} {method}\r\nContact: <sip:test@{ip}:{lport}>\r\n{extra}Content-Length: {len(body)}\r\n\r\n{body}")
         return text.encode()
@@ -90,7 +90,7 @@ async def main(a):
         if a.tcp:
             writer.write(data)
         else:
-            sip.transport.sendto(data, (ip, a.port))
+            sip.transport.sendto(data, (a.host, a.port))
 
     async def recv_sip(timeout=10):
         if a.tcp:
@@ -112,7 +112,7 @@ async def main(a):
             await asyncio.sleep(0.01)
 
     t0 = time.monotonic()
-    send(request("INVITE", 1, "Content-Type: application/sdp\r\n", offer_sdp(ip, aport, vport, a.opus)))
+    send(request("INVITE", 1, "Content-Type: application/sdp\r\n", offer_sdp(ip, aport, vport, a.opus, not a.late_video)))
     while True:
         start, headers, body = parse(await recv_sip())
         print("<<", start)
@@ -126,8 +126,21 @@ async def main(a):
     audio_codec = next(l for l in body.splitlines() if l.startswith("a=rtpmap") and ("opus" in l or "PCMU" in l))
     print("answer:", audio_codec, ports)
 
+    if a.late_video:
+        assert "video" not in ports, ports
+        await asyncio.sleep(1)
+        send(request("INVITE", 2, "Content-Type: application/sdp\r\n", offer_sdp(ip, aport, vport, a.opus), to_tag=totag))
+        while True:
+            start, headers, body = parse(await recv_sip())
+            print("<< re-INVITE", start)
+            if not start.startswith("SIP/2.0 1"):
+                break
+        ports = answer_ports(body)
+        print("after re-INVITE:", ports)
+        send(request("ACK", 2, to_tag=totag))
+
     # let the server learn our RTP source address, then listen
-    ap.transport.sendto(struct.pack("!BBHII", 0x80, 0, 0, 0, 1) + bytes(160), (ip, ports["audio"]))
+    ap.transport.sendto(struct.pack("!BBHII", 0x80, 0, 0, 0, 1) + bytes(160), (a.host, ports["audio"]))
     await asyncio.sleep(a.measure)
 
     dec_a = OpusDecoder() if a.opus else PcmuDecoder()
@@ -159,11 +172,11 @@ async def main(a):
     ts, seq = random.getrandbits(32), 1
     for i in range(100):
         dur = 160 * (i + 1)
-        ap.transport.sendto(struct.pack("!BBHII", 0x80, 101, seq, ts, 1) + bytes([2, 10, dur >> 8 & 255, dur & 255]), (ip, ports["audio"]))
+        ap.transport.sendto(struct.pack("!BBHII", 0x80, 101, seq, ts, 1) + bytes([2, 10, dur >> 8 & 255, dur & 255]), (a.host, ports["audio"]))
         seq += 1
         await asyncio.sleep(0.02)
     for _ in range(3):
-        ap.transport.sendto(struct.pack("!BBHII", 0x80, 0x80 | 101, seq, ts, 1) + bytes([2, 0x8A, 3, 0x20]), (ip, ports["audio"]))
+        ap.transport.sendto(struct.pack("!BBHII", 0x80, 0x80 | 101, seq, ts, 1) + bytes([2, 0x8A, 3, 0x20]), (a.host, ports["audio"]))
         seq += 1
     await asyncio.sleep(0.5)
     everything = decode_video(vp.packets)
@@ -176,15 +189,18 @@ async def main(a):
         Image.fromarray(before).save(f"{a.out}/before.png")
         Image.fromarray(after[-1]).save(f"{a.out}/after.png")
 
-    send(request("BYE", 2, to_tag=totag))
+    send(request("BYE", 3, to_tag=totag))
     start, _, _ = parse(await recv_sip())
     print("<<", start)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
+    p.add_argument("--host", default="127.0.0.1", help="server to call")
+    p.add_argument("--local", default="127.0.0.1", help="this machine's address as the server should see it")
     p.add_argument("--port", type=int, default=5060)
     p.add_argument("--tcp", action="store_true")
+    p.add_argument("--late-video", action="store_true", help="offer audio only, then add video with a re-INVITE")
     p.add_argument("--opus", action="store_true")
     p.add_argument("--measure", type=float, default=6)
     p.add_argument("--out")

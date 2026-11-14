@@ -47,7 +47,7 @@ Dial `sip:doom@<host>:5060` directly, or add an account whose registrar is `<hos
 Turn media encryption off (SRTP and ZRTP get a 488). Keep Opus or PCMU enabled for audio, and enable VP8 for video.
 Zoiper's free tier has no video, so use Linphone to see the game. DTMF type RFC 2833 (the default) works, SIP INFO works too.
 Use `--sip-port N` to move the port or `0` to turn the listener off. RTP uses UDP ports 10000 to 20000 (`RTP_PORT_MIN`, `RTP_PORT_MAX`).
-On a host with several addresses set `PHONEDOOM_IP` to the one phones should send media to.
+On a host with several addresses set `PHONEDOOM_IP` to the one phones should send media to. Behind NAT set `PHONEDOOM_PUBLIC_IP`, which is advertised to callers with public addresses while LAN callers still get the LAN address.
 `python tests/udp_call_test.py [--tcp] [--opus]` is a headless plain-SIP caller that checks fps, audio and that a held digit moves the player.
 
 ## Keys

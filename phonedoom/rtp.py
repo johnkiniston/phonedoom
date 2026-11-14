@@ -105,6 +105,8 @@ class Stream:
     codec: RTCRtpCodecParameters
     ssrc: int = field(default_factory=lambda: random.getrandbits(32))
     seq: int = field(default_factory=lambda: random.getrandbits(16))
+    spp: int = 160
+    lines: list = field(default_factory=list)
     task: asyncio.Task | None = None
 
     def send(self, payload, ts, marker):
@@ -127,6 +129,8 @@ class RtpMedia:
         self._last_rx = time.monotonic()
         self._keyframe = True
         self._tasks = []
+        self._session = int(time.time())
+        self._version = 0
 
     async def _bind(self, want_rtcp):
         loop = asyncio.get_running_loop()
@@ -145,43 +149,72 @@ class RtpMedia:
         raise OSError("no free RTP port")
 
     async def start(self, offer_sdp, local_ip):
+        answer = await self.negotiate(offer_sdp, local_ip)
+        self._tasks.append(asyncio.create_task(self._watchdog()))
+        return answer
+
+    async def negotiate(self, offer_sdp, local_ip):
+        """Answer an offer. A re-INVITE reuses live streams and can add or drop video."""
         sections = parse_offer(offer_sdp)
+        log.info("offer: %s", [(x.kind, x.port, x.proto, sorted({n for n, _ in x.maps.values()})) for x in sections])
         if not any(s.kind == "audio" for s in sections):
             raise UnsupportedMedia("no audio offered")
-        lines = ["v=0", f"o=doom {int(time.time())} 1 IN IP4 {local_ip}", "s=phonedoom", f"c=IN IP4 {local_ip}", "t=0 0"]
-        spp = 160
+        self._version += 1
+        lines = ["v=0", f"o=doom {self._session} {self._version} IN IP4 {local_ip}", "s=phonedoom", f"c=IN IP4 {local_ip}", "t=0 0"]
+        fresh = []
         for sec in sections:
-            codec = dtmf = None
             plain = sec.proto in ("RTP/AVP", "RTP/AVPF")
-            if sec.kind == "audio" and sec.port and "audio" not in self.streams:
-                if not plain:
-                    raise UnsupportedMedia(f"{sec.proto} is not supported, turn media encryption off")
-                codec, spp, dtmf = pick_audio(sec)
-            elif sec.kind == "video" and sec.port and plain and "video" not in self.streams:
-                codec = pick_video(sec)
-            if codec is None:
-                lines.append(f"m={sec.kind} 0 {sec.proto} {sec.pts[0] if sec.pts else 0}")
+            stream = self.streams.get(sec.kind)
+            if stream and sec.port:
+                stream.remote = (sec.ip, sec.port)
+                lines += stream.lines
                 continue
-            port, rtp, rtcp = await self._bind(not sec.rtcp_mux)
-            stream = Stream(sec.kind, rtp, rtcp, (sec.ip, sec.port), codec)
-            self.streams[sec.kind] = stream
-            fmts = [codec.payloadType] + ([dtmf] if dtmf is not None else [])
-            lines += [f"m={sec.kind} {port} RTP/AVP {' '.join(map(str, fmts))}",
-                      f"a=rtpmap:{codec.payloadType} {codec.mimeType.split('/')[1]}/{codec.clockRate}" + (f"/{codec.channels}" if (codec.channels or 1) > 1 else "")]
-            if dtmf is not None:
-                self._dtmf_pts.add(dtmf)
-                lines += [f"a=rtpmap:{dtmf} telephone-event/{sec.maps[dtmf][1]}", f"a=fmtp:{dtmf} 0-15"]
-            if sec.rtcp_mux:
-                lines.append("a=rtcp-mux")
-            lines.append("a=ptime:20" if sec.kind == "audio" else "a=sendonly")
-        for kind, stream in self.streams.items():
+            if stream:  # offerer removed this stream
+                self._drop(sec.kind)
+            elif sec.kind in ("audio", "video") and sec.port:
+                codec = dtmf = None
+                spp = 160
+                if sec.kind == "audio":
+                    if not plain:
+                        raise UnsupportedMedia(f"{sec.proto} is not supported, turn media encryption off")
+                    codec, spp, dtmf = pick_audio(sec)
+                elif plain:
+                    codec = pick_video(sec)
+                if codec:
+                    port, rtp, rtcp = await self._bind(not sec.rtcp_mux)
+                    stream = Stream(sec.kind, rtp, rtcp, (sec.ip, sec.port), codec, spp=spp)
+                    fmts = [codec.payloadType] + ([dtmf] if dtmf is not None else [])
+                    stream.lines = [f"m={sec.kind} {port} RTP/AVP {' '.join(map(str, fmts))}",
+                                    f"a=rtpmap:{codec.payloadType} {codec.mimeType.split('/')[1]}/{codec.clockRate}" + (f"/{codec.channels}" if (codec.channels or 1) > 1 else "")]
+                    if dtmf is not None:
+                        self._dtmf_pts.add(dtmf)
+                        stream.lines += [f"a=rtpmap:{dtmf} telephone-event/{sec.maps[dtmf][1]}", f"a=fmtp:{dtmf} 0-15"]
+                    if sec.rtcp_mux:
+                        stream.lines.append("a=rtcp-mux")
+                    stream.lines.append("a=ptime:20" if sec.kind == "audio" else "a=sendonly")
+                    self.streams[sec.kind] = stream
+                    fresh.append(stream)
+                    lines += stream.lines
+                    continue
+            lines.append(f"m={sec.kind} 0 {sec.proto} {sec.pts[0] if sec.pts else 0}")
+        for stream in fresh:
             enc = get_encoder(stream.codec)
-            run = self._audio_loop if kind == "audio" else self._video_loop
-            args = (stream, enc, spp) if kind == "audio" else (stream, enc)
-            self._tasks.append(asyncio.create_task(run(*args)))
-        self._tasks.append(asyncio.create_task(self._watchdog()))
+            if stream.kind == "audio":
+                stream.task = asyncio.create_task(self._audio_loop(stream, enc, stream.spp))
+            else:
+                self._keyframe = True
+                stream.task = asyncio.create_task(self._video_loop(stream, enc))
         log.info("rtp media %s", {k: (s.codec.mimeType, s.remote) for k, s in self.streams.items()})
         return "\r\n".join(lines) + "\r\n"
+
+    def _drop(self, kind):
+        stream = self.streams.pop(kind)
+        if stream.task:
+            stream.task.cancel()
+        for port in (stream.rtp, stream.rtcp):
+            if port:
+                port.transport.close()
+                self._ports.remove(port)
 
     def _on_packet(self, port, data, addr):
         self._last_rx = time.monotonic()
@@ -252,7 +285,8 @@ class RtpMedia:
                 return
 
     async def stop(self):
-        for t in self._tasks:
-            t.cancel()
+        for t in self._tasks + [x.task for x in self.streams.values()]:
+            if t:
+                t.cancel()
         for p in self._ports:
             p.transport.close()

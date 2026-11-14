@@ -37,6 +37,9 @@ class Call:
         log.info("[call %s] started (%s)", self.id, "webrtc" if webrtc else "rtp")
         return answer
 
+    async def reinvite(self, offer_sdp, local_ip=None):
+        return await self.media.negotiate(offer_sdp, local_ip)
+
     async def stop(self):
         if self._ended:
             return

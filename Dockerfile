@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY native native
+RUN mkdir -p native/run
 RUN make -C native/doomgeneric/doomgeneric -f Makefile.pipe clean \
  && make -C native/doomgeneric/doomgeneric -f Makefile.pipe CC=gcc -j"$(nproc)"
 

@@ -1,5 +1,6 @@
 """SIP over UDP and TCP, for softphones that do not speak WebSocket."""
 import asyncio
+import ipaddress
 import logging
 import os
 import socket
@@ -14,6 +15,9 @@ log = logging.getLogger("sipnet")
 def local_ip_for(peer_ip):
     if os.environ.get("PHONEDOOM_IP"):
         return os.environ["PHONEDOOM_IP"]
+    public = os.environ.get("PHONEDOOM_PUBLIC_IP")
+    if public and not ipaddress.ip_address(peer_ip).is_private:
+        return public
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect((peer_ip, 9))
         return s.getsockname()[0]
@@ -50,7 +54,7 @@ def tcp_handler(ua):
     async def handle(reader, writer):
         peer = writer.get_extra_info("peername")[:2]
         local = writer.get_extra_info("sockname")[:2]
-        link = Link("tcp", peer, local[0], local[1])
+        link = Link("tcp", peer, local_ip_for(peer[0]) if os.environ.get("PHONEDOOM_PUBLIC_IP") else local[0], local[1])
 
         async def send(reply):
             writer.write(reply.encode())

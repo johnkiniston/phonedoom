@@ -74,6 +74,9 @@ class WebRtcMedia:
         await pc.setLocalDescription(await pc.createAnswer())
         return pc.localDescription.sdp
 
+    async def negotiate(self, offer_sdp, local_ip=None):
+        raise ValueError("re-INVITE is not supported on WebRTC calls")
+
     async def stop(self):
         await self._blackhole.stop()
         await self.pc.close()
