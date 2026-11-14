@@ -8,3 +8,4 @@ native/run/.default.cfg
 native/run/*.cfg
 **/*.wad
 **/*.WAD
+models

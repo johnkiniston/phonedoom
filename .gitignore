@@ -8,3 +8,4 @@ native/doomgeneric/doomgeneric/doomphone
 native/run/*
 !native/run/.gitkeep
 .DS_Store
+models/

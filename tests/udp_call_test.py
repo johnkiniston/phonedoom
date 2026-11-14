@@ -168,14 +168,41 @@ async def main(a):
     print(f"video: {len(pics)} frames decoded, {len(pics) / span:.1f} fps, {pics[0][1].shape[::-1]}")
     pressed_at = time.monotonic()
 
-    # hold digit 2 (forward) as RFC 4733 for 2 seconds
     ts, seq = random.getrandbits(32), 1
-    for i in range(100):
+    if a.say:
+        import subprocess, tempfile, av
+        from fractions import Fraction
+        from aiortc.codecs.g711 import PcmuEncoder
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["say", "-o", f"{tmp}/s.aiff", a.say], check=True)
+            rate, layout, size = (48000, "stereo", 960) if a.opus else (8000, "mono", 160)
+            from aiortc.codecs.opus import OpusEncoder
+            rs, enc, packets = av.AudioResampler(format="s16", layout=layout, rate=rate, frame_size=size), (OpusEncoder() if a.opus else PcmuEncoder()), []
+            with av.open(f"{tmp}/s.aiff") as c:
+                for f in c.decode(audio=0):
+                    for g in rs.resample(f):
+                        g.pts, g.time_base = len(packets) * size, Fraction(1, rate)
+                        packets += enc.encode(g)[0]
+        packets += [bytes([0xFF]) * 160] * 100 if not a.opus else []
+        if a.opus:
+            silent = av.AudioFrame.from_ndarray(np.zeros((1, 960 * 2), np.int16), format="s16", layout="stereo")
+            silent.sample_rate = 48000
+            for i in range(100):
+                silent.pts, silent.time_base = (len(packets) + i) * 960, Fraction(1, 48000)
+                packets += enc.encode(silent)[0]
+        for payload in packets:
+            ap.transport.sendto(struct.pack("!BBHII", 0x80, 111 if a.opus else 0, seq, ts, 1) + payload, (a.host, ports["audio"]))
+            seq += 1
+            ts += 960 if a.opus else 160
+            await asyncio.sleep(0.02)
+        packets = []
+    # hold digit 2 (forward) as RFC 4733 for 2 seconds
+    for i in range(0 if a.say else 100):
         dur = 160 * (i + 1)
         ap.transport.sendto(struct.pack("!BBHII", 0x80, 101, seq, ts, 1) + bytes([2, 10, dur >> 8 & 255, dur & 255]), (a.host, ports["audio"]))
         seq += 1
         await asyncio.sleep(0.02)
-    for _ in range(3):
+    for _ in range(0 if a.say else 3):
         ap.transport.sendto(struct.pack("!BBHII", 0x80, 0x80 | 101, seq, ts, 1) + bytes([2, 0x8A, 3, 0x20]), (a.host, ports["audio"]))
         seq += 1
     await asyncio.sleep(0.5)
@@ -201,6 +228,7 @@ if __name__ == "__main__":
     p.add_argument("--port", type=int, default=5060)
     p.add_argument("--tcp", action="store_true")
     p.add_argument("--late-video", action="store_true", help="offer audio only, then add video with a re-INVITE")
+    p.add_argument("--say", help="speak this to the phone instead of pressing digit 2 (macOS say)")
     p.add_argument("--opus", action="store_true")
     p.add_argument("--measure", type=float, default=6)
     p.add_argument("--out")

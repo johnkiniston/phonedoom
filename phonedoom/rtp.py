@@ -11,7 +11,8 @@ import random
 import time
 from dataclasses import dataclass, field
 
-from aiortc.codecs import get_encoder
+from aiortc.codecs import get_decoder, get_encoder
+from aiortc.jitterbuffer import JitterFrame
 from aiortc.rtcrtpparameters import RTCRtpCodecParameters
 from aiortc.rtp import RtpPacket, is_rtcp
 
@@ -118,8 +119,10 @@ class Stream:
 
 
 class RtpMedia:
-    def __init__(self, doom, on_dtmf, on_dead):
+    def __init__(self, doom, on_dtmf, on_dead, on_audio=None):
         self.doom = doom
+        self.on_audio = on_audio
+        self._decoder = None
         self.on_dtmf = on_dtmf
         self.on_dead = on_dead
         self.streams = {}
@@ -234,6 +237,14 @@ class RtpMedia:
             pkt = RtpPacket.parse(data)
         except Exception:
             return
+        if self.on_audio and pkt.payload_type == stream.codec.payloadType:
+            if self._decoder is None:
+                self._decoder = get_decoder(stream.codec)
+            try:
+                for frame in self._decoder.decode(JitterFrame(pkt.payload, pkt.timestamp)):
+                    self.on_audio(frame)
+            except Exception:
+                log.debug("undecodable audio packet")
         if pkt.payload_type in self._dtmf_pts and len(pkt.payload) >= 4:
             event, flags = pkt.payload[0], pkt.payload[1]
             if event >= len(TONES):

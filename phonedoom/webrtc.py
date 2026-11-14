@@ -48,18 +48,23 @@ class DoomAudio(MediaStreamTrack):
 
 
 class WebRtcMedia:
-    def __init__(self, doom, on_dtmf, on_dead):
+    def __init__(self, doom, on_dtmf, on_dead, on_audio=None):
         self.doom = doom
+        self.on_audio = on_audio
         self.on_dead = on_dead
         self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         self._blackhole = MediaBlackhole()
+        self._listener = None
 
     async def start(self, offer_sdp, local_ip=None):
         pc = self.pc
 
         @pc.on("track")
         def on_track(track):
-            self._blackhole.addTrack(track)
+            if track.kind == "audio" and self.on_audio:
+                self._listener = asyncio.create_task(self._listen(track))
+            else:
+                self._blackhole.addTrack(track)
 
         @pc.on("connectionstatechange")
         async def on_state():
@@ -74,9 +79,18 @@ class WebRtcMedia:
         await pc.setLocalDescription(await pc.createAnswer())
         return pc.localDescription.sdp
 
+    async def _listen(self, track):
+        try:
+            while True:
+                self.on_audio(await track.recv())
+        except Exception:
+            pass
+
     async def negotiate(self, offer_sdp, local_ip=None):
         raise ValueError("re-INVITE is not supported on WebRTC calls")
 
     async def stop(self):
+        if self._listener:
+            self._listener.cancel()
         await self._blackhole.stop()
         await self.pc.close()

@@ -50,6 +50,16 @@ Use `--sip-port N` to move the port or `0` to turn the listener off. RTP uses UD
 On a host with several addresses set `PHONEDOOM_IP` to the one phones should send media to. Behind NAT set `PHONEDOOM_PUBLIC_IP`, which is advertised to callers with public addresses while LAN callers still get the LAN address.
 `python tests/udp_call_test.py [--tcp] [--opus]` is a headless plain-SIP caller that checks fps, audio and that a held digit moves the player.
 
+## Voice commands
+
+Say a command into the phone (or the browser mic) and it presses the key for you.
+`forward`, `backwards`, `strafe left`, `strafe right`, `turn left`, `turn right`, `shoot`, `open door`, `map`,
+`next weapon`, `run` (toggles), `stop` (lets go of everything). Moves are timed taps, about 1 s for forward and back.
+Recognition is offline Vosk limited to those phrases, so other speech is ignored. Install the model with
+`scripts/fetch-vosk-model.sh` (the Docker image does it for you). Without the model, voice is off and the keypad still works.
+A speaker held away from the mic can feed Doom's sound back into the recognizer, so a headset works best.
+`python tests/voice_test.py` (macOS) checks accuracy with synthesized voices, and `tests/udp_call_test.py --say forward` speaks to a live server.
+
 ## Keys
 
 2 forward, 8 back, 4/6 turn, 1/3 strafe, 5 fire, * use/open, 0 run, 7/9 weapon, # automap.

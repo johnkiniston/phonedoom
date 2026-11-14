@@ -6,6 +6,7 @@ import secrets
 import time
 
 from .doom import DoomProcess
+from . import voice
 from .rtp import RtpMedia
 from .webrtc import WebRtcMedia
 
@@ -14,6 +15,9 @@ log = logging.getLogger("call")
 # doomkeys.h codes
 KEY = {"1": 0xA0, "2": 0xAD, "3": 0xA1, "4": 0xAC, "5": 0xA3, "6": 0xAE, "8": 0xAF, "*": 0xA2, "0": 0xB6, "#": 9}
 LATCHABLE = set("12345680")
+# spoken phrase -> (keypad key, press length in ms)
+VOICE_KEYS = {"forward": ("2", 1000), "backwards": ("8", 1000), "strafe left": ("1", 600), "strafe right": ("3", 600),
+              "turn left": ("4", 400), "turn right": ("6", 400), "shoot": ("5", 700), "open door": ("*", 150), "map": ("#", 100)}
 
 
 class Call:
@@ -22,6 +26,7 @@ class Call:
         self.on_end = on_end
         self.doom = DoomProcess()
         self.media = None
+        self.voice = None
         self._ended = False
         self.mode = os.environ.get("DOOM_MODE", "hold")
         self.weapon = 2
@@ -32,7 +37,10 @@ class Call:
         await self.doom.start()
         await asyncio.wait_for(self.doom.ready.wait(), 30)
         webrtc = "a=fingerprint" in offer_sdp
-        self.media = (WebRtcMedia if webrtc else RtpMedia)(self.doom, self.dtmf, self.stop)
+        model = voice.load_model()
+        if model:
+            self.voice = voice.Voice(model, self.voice_command)
+        self.media = (WebRtcMedia if webrtc else RtpMedia)(self.doom, self.dtmf, self.stop, self.voice and self.voice.hear)
         answer = await self.media.start(offer_sdp, local_ip)
         log.info("[call %s] started (%s)", self.id, "webrtc" if webrtc else "rtp")
         return answer
@@ -47,6 +55,8 @@ class Call:
         for h in self._down.values():
             if h:
                 h.cancel()
+        if self.voice:
+            self.voice.close()
         if self.media:
             await self.media.stop()
         await self.doom.stop()
@@ -97,6 +107,22 @@ class Call:
                 self._press(code, None)
         else:
             self._press(code, min(max(dur, 60), 1000))
+
+    def voice_command(self, text):
+        log.info("[call %s] heard %r", self.id, text)
+        if text == "stop":
+            self._release_all()
+        elif text == "run":
+            code = KEY["0"]
+            if code in self._down and self._down[code] is None:
+                self._release(code)
+            else:
+                self._press(code, None)
+        elif text == "next weapon":
+            self._tone("9", 0, 0)
+        else:
+            tone, ms = VOICE_KEYS[text]
+            self._press(KEY[tone], ms)
 
     def dtmf(self, tone, first, end):
         """RFC 4733 event packet. The first packet presses, later packets keep a held key down."""

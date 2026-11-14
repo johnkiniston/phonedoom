@@ -1,12 +1,15 @@
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential libsdl2-dev libsdl2-mixer-dev timgm6mb-soundfont \
+      build-essential curl unzip libsdl2-dev libsdl2-mixer-dev timgm6mb-soundfont \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+COPY scripts/fetch-vosk-model.sh scripts/
+RUN sh scripts/fetch-vosk-model.sh /app/models
 
 COPY native native
 RUN mkdir -p native/run

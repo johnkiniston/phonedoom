@@ -4,7 +4,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from . import sipnet
+from . import sipnet, voice
 from .doom import DOOM_BIN, WAD
 from .sipua import UserAgent
 
@@ -54,4 +54,5 @@ def main():
         if not path.exists():
             raise SystemExit(f'{what} not found at {path}. See README (build the binary; supply your own doom1.wad via DOOM_WAD).')
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    voice.load_model()
     web.run_app(build_app(args.sip_port, args.host), host=args.host, port=args.port, print=lambda s: print(f"The Doom Phone on http://{args.host}:{args.port}/"))
