@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+legacy/
+*.wad
+*.WAD
+native/doomgeneric/doomgeneric/build/
+native/doomgeneric/doomgeneric/doomphone
+native/run/*
+!native/run/.gitkeep
+.DS_Store

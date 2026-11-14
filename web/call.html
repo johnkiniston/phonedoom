@@ -1,0 +1,109 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call the Doom Phone</title>
+<style>
+body{background:#1a1a1a;color:#ddd;font:14px system-ui;margin:16px;max-width:900px}
+#row{display:flex;gap:20px;flex-wrap:wrap}
+video{width:640px;max-width:100%;background:#000;image-rendering:pixelated}
+#pad{display:grid;grid-template-columns:repeat(3,90px);gap:8px}
+#pad button{height:70px;font-size:20px;background:#333;color:#fff;border:1px solid #555;border-radius:8px;touch-action:none;user-select:none}
+#pad button small{display:block;font-size:11px;color:#9c9}
+#pad button.on{background:#a22}
+#log{font:12px monospace;height:150px;overflow:auto;background:#000;padding:6px;white-space:pre-wrap}
+button.big{padding:8px 16px;font-size:16px}
+</style>
+<h2>Call the Doom Phone</h2>
+<p><button id="call" class="big">Call sip:doom</button> <button id="hang" class="big" disabled>Hang up</button>
+ Keypad mode: <select id="mode"><option>hold</option><option>pulse</option><option>latch</option></select>
+ <span id="state">idle</span></p>
+<div id="row">
+ <video id="v" autoplay playsinline></video>
+ <div><div id="pad"></div><p id="stats"></p></div>
+</div>
+<div id="log"></div>
+<script src="/sip.bundle.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const $ = id => document.getElementById(id);
+const log = s => { console.log(s); $('log').textContent += s + '\n'; $('log').scrollTop = 1e9; };
+const LABELS = { '1': 'strafe L', '2': 'forward', '3': 'strafe R', '4': 'turn L', '5': 'FIRE', '6': 'turn R', '7': 'prev wpn', '8': 'back', '9': 'next wpn', '*': 'use/open', '0': 'run', '#': 'automap' };
+window.__state = 'idle';
+const setState = s => { window.__state = s; $('state').textContent = s; };
+
+let ua, inviter;
+const rtts = [];
+const sendInfo = (type, content) => {
+  const t0 = performance.now();
+  return inviter.info({ requestOptions: { body: { contentDisposition: 'render', contentType: type, content } } })
+    .then(() => { rtts.push(performance.now() - t0); const s = [...rtts].sort((a, b) => a - b); $('stats').textContent = `INFO round trip median ${s[s.length >> 1].toFixed(0)} ms, n=${s.length}`; })
+    .catch(e => log('INFO failed ' + e));
+};
+const sendTone = (t, d) => sendInfo('application/dtmf-relay', `Signal=${t}\r\nDuration=${d}\r\nSent=${Date.now()}`);
+window.sendTone = sendTone;
+
+const repeaters = new Map();
+function keyDown(t) {
+  if (!inviter || window.__state !== 'connected' || repeaters.has(t)) return;
+  const mode = $('mode').value;
+  $('pad').querySelector(`[data-t="${CSS.escape(t)}"]`)?.classList.add('on');
+  if (mode === 'hold') {
+    sendTone(t, 140);
+    repeaters.set(t, setInterval(() => sendTone(t, 140), 90));
+  } else { sendTone(t, 160); repeaters.set(t, null); }
+}
+function keyUp(t) {
+  if (!repeaters.has(t)) return;
+  clearInterval(repeaters.get(t)); repeaters.delete(t);
+  $('pad').querySelector(`[data-t="${CSS.escape(t)}"]`)?.classList.remove('on');
+}
+window.keyDown = keyDown; window.keyUp = keyUp;
+
+for (const t of '123456789*0#') {
+  const b = document.createElement('button');
+  b.dataset.t = t; b.innerHTML = `${t}<small>${LABELS[t]}</small>`;
+  b.onpointerdown = e => { b.setPointerCapture(e.pointerId); keyDown(t); };
+  b.onpointerup = b.onpointercancel = () => keyUp(t);
+  $('pad').append(b);
+}
+addEventListener('keydown', e => { if (e.repeat || e.target.tagName === 'SELECT') return; if ('0123456789*#'.includes(e.key) && e.key.length === 1) keyDown(e.key); });
+addEventListener('keyup', e => keyUp(e.key));
+$('mode').onchange = () => { sendInfo('application/x-doom-mode', $('mode').value); log('mode ' + $('mode').value); };
+
+const mediaStreamFactory = async () => {
+  const ac = new AudioContext(), d = ac.createMediaStreamDestination();
+  const c = document.createElement('canvas'); c.width = c.height = 16; c.getContext('2d').fillRect(0, 0, 16, 16);
+  return new MediaStream([...d.stream.getAudioTracks(), ...c.captureStream(2).getVideoTracks()]);
+};
+
+async function call() {
+  $('call').disabled = true; setState('calling');
+  ua = new SIP.UserAgent({
+    uri: SIP.UserAgent.makeURI('sip:caller' + Math.floor(Math.random() * 1e4) + '@' + location.hostname),
+    transportOptions: { server: `ws://${location.host}/sip` },
+    sessionDescriptionHandlerFactory: SIP.Web.defaultSessionDescriptionHandlerFactory(mediaStreamFactory),
+    sessionDescriptionHandlerFactoryOptions: { peerConnectionConfiguration: { iceServers: [] } },
+    logLevel: 'warn',
+  });
+  ua.transport.onDisconnect = () => { log('server connection lost'); if (window.__state !== 'idle') { setState('call lost (server connection closed)'); $('call').disabled = false; $('hang').disabled = true; } };
+  await ua.start();
+  inviter = new SIP.Inviter(ua, SIP.UserAgent.makeURI('sip:doom@' + location.hostname), { sessionDescriptionHandlerOptions: { constraints: { audio: true, video: true } } });
+  inviter.stateChange.addListener(s => {
+    log('call state ' + s);
+    if (s === 'Established') {
+      const pc = window.__pc = inviter.sessionDescriptionHandler.peerConnection;
+      const ms = new MediaStream();
+      pc.getReceivers().forEach(r => r.track && ms.addTrack(r.track));
+      $('v').srcObject = ms; $('v').play().catch(() => { $('v').muted = true; $('v').play(); log('autoplay blocked: video muted, click the video to unmute'); $('v').onclick = () => { $('v').muted = false; };});
+      pc.oniceconnectionstatechange = () => { log('ice ' + pc.iceConnectionState); if (['failed', 'closed'].includes(pc.iceConnectionState)) { setState('call lost'); $('call').disabled = false; $('hang').disabled = true; } else if (pc.iceConnectionState === 'connected') setState('connected'); else if (pc.iceConnectionState !== 'completed') setState('answered, connecting media (' + pc.iceConnectionState + ')'); };
+      $('hang').disabled = false; setState(pc.iceConnectionState === 'connected' ? 'connected' : 'answered, connecting media (' + pc.iceConnectionState + ')');
+      if (params.get('mode')) { $('mode').value = params.get('mode'); $('mode').onchange(); }
+    }
+    if (s === 'Terminated') { setState('idle'); $('call').disabled = false; $('hang').disabled = true; }
+  });
+  inviter.invite({ requestDelegate: { onReject: r => { log('rejected ' + r.message.statusCode); setState('idle'); $('call').disabled = false; } } });
+}
+$('call').onclick = call;
+$('hang').onclick = () => inviter.bye();
+if (params.get('auto')) call();
+</script>
