@@ -1,148 +1,19 @@
-"""One phone call: a native Doom process whose frames and audio feed aiortc tracks."""
+"""One phone call: a Doom process, a media transport, and the keypad-to-key policy."""
 import asyncio
-import fractions
-import glob
 import logging
 import os
 import secrets
 import time
-from pathlib import Path
 
-import av
-import numpy as np
-from aiortc import MediaStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-from aiortc.contrib.media import MediaBlackhole
+from .doom import DoomProcess
+from .rtp import RtpMedia
+from .webrtc import WebRtcMedia
 
 log = logging.getLogger("call")
-ROOT = Path(__file__).resolve().parent.parent
-DOOM_BIN = Path(os.environ.get("DOOM_BIN", ROOT / "native/doomgeneric/doomgeneric/doomphone"))
-WAD = Path(os.environ.get("DOOM_WAD", ROOT / "native/doom1.wad"))
-RUN_DIR = Path(os.environ.get("DOOM_RUN_DIR", ROOT / "native/run"))
-W, H = 320, 200
-FRAME_BYTES = W * H * 4
-RATE, SAMPLES = 44100, 882  # 20 ms of Doom's 44.1 kHz stereo audio
-CHUNK = SAMPLES * 4
 
 # doomkeys.h codes
 KEY = {"1": 0xA0, "2": 0xAD, "3": 0xA1, "4": 0xAC, "5": 0xA3, "6": 0xAE, "8": 0xAF, "*": 0xA2, "0": 0xB6, "#": 9}
 LATCHABLE = set("12345680")
-
-
-def find_soundfont():
-    env = os.environ.get("SF2")
-    if env:
-        return env
-    patterns = ["/usr/share/sounds/sf2/*.sf2", "/usr/share/soundfonts/*.sf2", "/opt/homebrew/Cellar/fluid-synth/*/share/fluid-synth/sf2/*.sf2"]
-    for p in patterns:
-        found = sorted(glob.glob(p))
-        if found:
-            return found[0]
-    return ""
-
-
-class DoomProcess:
-    def __init__(self):
-        self.latest = None
-        self.ready = asyncio.Event()
-        self.audio = bytearray()
-        self.proc = None
-        self._tasks = []
-
-    async def start(self):
-        vr, vw = os.pipe()
-        ar, aw = os.pipe()
-        env = {**os.environ, "SDL_AUDIODRIVER": "disk", "SDL_DISKAUDIOFILE": f"/dev/fd/{aw}",
-               "SDL_SOUNDFONTS": find_soundfont(), "DOOM_VIDEO_FD": str(vw)}
-        self.proc = await asyncio.create_subprocess_exec(
-            str(DOOM_BIN), "-iwad", str(WAD), "-skill", "3", "-warp", "1", "1",
-            cwd=RUN_DIR, env=env, pass_fds=(vw, aw),
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        os.close(vw)
-        os.close(aw)
-        loop = asyncio.get_running_loop()
-        self._vreader = asyncio.StreamReader(limit=FRAME_BYTES * 2)
-        await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(self._vreader), os.fdopen(vr, "rb", 0))
-        self._areader = asyncio.StreamReader()
-        await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(self._areader), os.fdopen(ar, "rb", 0))
-        self._tasks = [asyncio.create_task(self._pump_video()), asyncio.create_task(self._pump_audio())]
-
-    async def _pump_video(self):
-        try:
-            while True:
-                self.latest = await self._vreader.readexactly(FRAME_BYTES)
-                self.ready.set()
-        except (asyncio.IncompleteReadError, asyncio.CancelledError):
-            pass
-
-    async def _pump_audio(self):
-        cap = RATE * 4 // 4  # keep at most ~250 ms so latency stays low
-        try:
-            while True:
-                chunk = await self._areader.read(65536)
-                if not chunk:
-                    return
-                self.audio += chunk
-                if len(self.audio) > cap:
-                    del self.audio[: len(self.audio) - cap]
-        except asyncio.CancelledError:
-            pass
-
-    def take_audio(self):
-        if len(self.audio) < CHUNK:
-            return bytes(CHUNK)
-        out = bytes(self.audio[:CHUNK])
-        del self.audio[:CHUNK]
-        return out
-
-    def key(self, code, pressed):
-        if self.proc and self.proc.stdin and not self.proc.stdin.is_closing():
-            self.proc.stdin.write(bytes([1 if pressed else 0, code]))
-
-    async def stop(self):
-        for t in self._tasks:
-            t.cancel()
-        if self.proc and self.proc.returncode is None:
-            self.proc.kill()
-            await self.proc.wait()
-
-
-class DoomVideo(VideoStreamTrack):
-    def __init__(self, doom):
-        super().__init__()
-        self.doom = doom
-
-    async def recv(self):
-        pts, time_base = await self.next_timestamp()
-        data = self.doom.latest or bytes(FRAME_BYTES)
-        frame = av.VideoFrame.from_ndarray(np.frombuffer(data, np.uint8).reshape(H, W, 4), format="bgra")
-        frame.pts, frame.time_base = pts, time_base
-        return frame
-
-
-class DoomAudio(MediaStreamTrack):
-    kind = "audio"
-
-    def __init__(self, doom):
-        super().__init__()
-        self.doom = doom
-        self._start = None
-        self._ts = 0
-
-    async def recv(self):
-        if self._start is None:
-            self._start = time.time()
-        else:
-            self._ts += SAMPLES
-            wait = self._start + self._ts / RATE - time.time()
-            if wait > 0:
-                await asyncio.sleep(wait)
-        pcm = np.frombuffer(self.doom.take_audio(), np.int16).astype(np.int32)
-        pcm = (pcm // 2).astype(np.int16).reshape(1, -1)  # Doom output clips at full scale
-        frame = av.AudioFrame.from_ndarray(pcm, format="s16", layout="stereo")
-        frame.sample_rate = RATE
-        frame.pts = self._ts
-        frame.time_base = fractions.Fraction(1, RATE)
-        return frame
 
 
 class Call:
@@ -150,36 +21,21 @@ class Call:
         self.id = secrets.token_hex(3)
         self.on_end = on_end
         self.doom = DoomProcess()
-        self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-        self._blackhole = MediaBlackhole()
+        self.media = None
         self._ended = False
-        self.mode = "hold"
+        self.mode = os.environ.get("DOOM_MODE", "hold")
         self.weapon = 2
         self._down = {}
         self._latched = set()
 
-    async def start(self, offer_sdp):
+    async def start(self, offer_sdp, local_ip=None):
         await self.doom.start()
         await asyncio.wait_for(self.doom.ready.wait(), 30)
-        pc = self.pc
-
-        @pc.on("track")
-        def on_track(track):
-            self._blackhole.addTrack(track)
-
-        @pc.on("connectionstatechange")
-        async def on_state():
-            log.info("[call %s] pc %s", self.id, pc.connectionState)
-            if pc.connectionState in ("failed", "closed"):
-                await self.stop()
-
-        await pc.setRemoteDescription(RTCSessionDescription(offer_sdp, "offer"))
-        pc.addTrack(DoomVideo(self.doom))
-        pc.addTrack(DoomAudio(self.doom))
-        await self._blackhole.start()
-        await pc.setLocalDescription(await pc.createAnswer())
-        log.info("[call %s] started", self.id)
-        return pc.localDescription.sdp
+        webrtc = "a=fingerprint" in offer_sdp
+        self.media = (WebRtcMedia if webrtc else RtpMedia)(self.doom, self.dtmf, self.stop)
+        answer = await self.media.start(offer_sdp, local_ip)
+        log.info("[call %s] started (%s)", self.id, "webrtc" if webrtc else "rtp")
+        return answer
 
     async def stop(self):
         if self._ended:
@@ -188,9 +44,9 @@ class Call:
         for h in self._down.values():
             if h:
                 h.cancel()
-        await self._blackhole.stop()
+        if self.media:
+            await self.media.stop()
         await self.doom.stop()
-        await self.pc.close()
         log.info("[call %s] ended", self.id)
         self.on_end()
 
@@ -238,6 +94,13 @@ class Call:
                 self._press(code, None)
         else:
             self._press(code, min(max(dur, 60), 1000))
+
+    def dtmf(self, tone, first, end):
+        """RFC 4733 event packet. The first packet presses, later packets keep a held key down."""
+        if first:
+            self._tone(tone, 160, 0)
+        elif not end and self.mode == "hold" and tone in KEY:
+            self._press(KEY[tone], 120)
 
     def info(self, content_type, body):
         if "x-doom-mode" in content_type:

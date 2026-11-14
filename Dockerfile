@@ -18,5 +18,5 @@ COPY tests tests
 
 ENV DOOM_WAD=/wad/doom1.wad
 ENV SF2=/usr/share/sounds/sf2/TimGM6mb.sf2
-EXPOSE 8080
+EXPOSE 8080 5060/udp 5060/tcp
 CMD ["python", "-m", "phonedoom"]
